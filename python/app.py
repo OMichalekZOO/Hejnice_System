@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import date
+from smtplib import SMTP
 from typing import List, Dict, Optional
 import secrets  # pro krátký náhodný suffix
 
@@ -37,8 +37,6 @@ st.markdown(f"""
 # --- CZ FONTY (ReportLab) ---
 from pathlib import Path
 from reportlab import rl_config
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.fonts import addMapping  # ⬅️ důležité
 
 FONT_DIR = Path("static/fonts")
@@ -109,18 +107,21 @@ def ensure_czech_fonts() -> None:
         pass
 
 
+from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent
 
-# --- MULTI-SITE (Hejnice / Dobrejov) ---
+
 SITES = {
     "Hejnice": {
-        "db": "reservations_hejnice.db",
-        "config": "config_Hejnice.csv",
+        "db":     str(BASE_DIR / "reservations_hejnice.db"),
+        "config": str(BASE_DIR / "config_Hejnice.csv"),  # nebo Hejnice.csv, pokud tak chceš
     },
     "Dobřejov": {
-        "db": "reservations_dobrejov.db",
-        "config": "config_Dobřejov.csv",
+        "db":     str(BASE_DIR / "reservations_dobrejov.db"),
+        "config": str(BASE_DIR / "config_Dobřejov.csv"),
     },
 }
+MAIL_CONFIG_PATH = str(BASE_DIR / "configMAIL.csv")
 
 CZ_MONTHS = [
     "",  # index 0 prázdný (aby 1=leden)
@@ -128,8 +129,6 @@ CZ_MONTHS = [
     "Červenec", "Srpen", "Září", "Říjen", "Listopad", "Prosinec"
 ]
 
-import smtplib, ssl
-from email.message import EmailMessage
 import re
 
 
@@ -137,13 +136,7 @@ def _valid_email(addr: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", addr or ""))
 
 @st.cache_data(show_spinner=False)
-def load_mail_config(path: str = MAIL_CONFIG_PATH) -> dict:
-    """
-    Jednotný adresát (Hejnice i Dobřejov). Ignoruje SITE.
-    Vezme první neprázdný EMAIL z configMAIL.csv.
-    Volitelné sloupce: SUBJECT_VOUCHER, SUBJECT_PARTICIPANTS, BODY_VOUCHER, BODY_PARTICIPANTS.
-    Fallback: st.secrets['RECIPIENT_EMAIL'].
-    """
+def load_mail_config(path: str, file_mtime: float) -> dict:
     fallback = {
         "EMAIL": (st.secrets.get("RECIPIENT_EMAIL") or "").strip(),
         "SUBJECT_VOUCHER": "",
@@ -151,23 +144,27 @@ def load_mail_config(path: str = MAIL_CONFIG_PATH) -> dict:
         "BODY_VOUCHER": "",
         "BODY_PARTICIPANTS": "",
     }
-
-    try:
-        df = pd.read_csv(path, encoding="utf-8")
-    except Exception:
+    from pathlib import Path
+    p = Path(path)
+    if not p.exists() or p.stat().st_size == 0:
         return fallback
+
+    import pandas as pd
+    try:
+        df = pd.read_csv(p, encoding="utf-8", sep=None, engine="python")  # autodetekce , ; \t
+    except Exception:
+        df = pd.read_csv(p, encoding="cp1250", sep=None, engine="python")
 
     df.columns = [str(c).strip().upper() for c in df.columns]
     if "EMAIL" not in df.columns:
         return fallback
 
-    # první neprázdný EMAIL
     df_nonempty = df[df["EMAIL"].fillna("").astype(str).str.strip() != ""]
     if df_nonempty.empty:
         return fallback
 
     row = df_nonempty.iloc[0]
-    cfg = {
+    return {
         "EMAIL": str(row.get("EMAIL", "")).strip(),
         "SUBJECT_VOUCHER": str(row.get("SUBJECT_VOUCHER", "") or "").strip(),
         "SUBJECT_PARTICIPANTS": str(row.get("SUBJECT_PARTICIPANTS", "") or "").strip(),
@@ -175,17 +172,11 @@ def load_mail_config(path: str = MAIL_CONFIG_PATH) -> dict:
         "BODY_PARTICIPANTS": str(row.get("BODY_PARTICIPANTS", "") or "").strip(),
     }
 
-    if not cfg["EMAIL"]:
-        cfg["EMAIL"] = fallback["EMAIL"]
-
-    return cfg
-
-
 def get_mail_recipient() -> tuple[str, dict]:
-    """
-    Vrací (email, metadata). Hláškuje, když není k dispozici žádný e-mail.
-    """
-    cfg = load_mail_config()
+    from pathlib import Path
+    p = Path(MAIL_CONFIG_PATH)
+    mtime = p.stat().st_mtime if p.exists() else 0.0
+    cfg = load_mail_config(MAIL_CONFIG_PATH, mtime)
     email = cfg.get("EMAIL", "")
     if not email:
         st.error("Adresát e-mailu není definován: doplňte EMAIL v configMAIL.csv nebo RECIPIENT_EMAIL ve st.secrets.")
@@ -194,16 +185,14 @@ def get_mail_recipient() -> tuple[str, dict]:
 
 def send_email_with_attachment(to_email: str, subject: str, body: str,
                                attachment_bytes: bytes, filename: str) -> None:
-    """
-    Pošle e-mail s PDF přílohou pomocí SMTP parametrů ve st.secrets.
-    Počítá s těmito hodnotami:
-      SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM
-    """
+    import smtplib, ssl
+    from email.message import EmailMessage
+
     host = st.secrets.get("SMTP_HOST")
-    port = int(st.secrets.get("SMTP_PORT", 587))
+    port = int(st.secrets.get("SMTP_PORT", 25))
     user = st.secrets.get("SMTP_USER")
     pwd  = st.secrets.get("SMTP_PASS")
-    from_addr = st.secrets.get("SMTP_FROM") or user
+    from_addr = (st.secrets.get("SMTP_FROM") or user or "").strip()
 
     if not all([host, port, user, pwd, from_addr]):
         raise RuntimeError("Chybí SMTP parametry ve st.secrets (SMTP_HOST/PORT/USER/PASS/FROM).")
@@ -216,15 +205,31 @@ def send_email_with_attachment(to_email: str, subject: str, body: str,
     msg["From"] = from_addr
     msg["To"] = to_email
     msg.set_content(body)
+    msg.add_attachment(attachment_bytes, maintype="application", subtype="pdf", filename=filename)
 
-    msg.add_attachment(attachment_bytes, maintype="application",
-                       subtype="pdf", filename=filename)
-
+    # 465 => SSL; jinak STARTTLS. Možno přepnout přes SMTP_SSL=true/false v secrets.
+    secure_override = str(st.secrets.get("SMTP_SSL", "")).lower()
+    use_ssl = False
+    timeout = int(st.secrets.get("SMTP_TIMEOUT", 20))
     context = ssl.create_default_context()
-    with smtplib.SMTP(host, port) as server:
-        server.starttls(context=context)
-        server.login(user, pwd)
-        server.send_message(msg)
+
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, timeout=timeout, context=context) as server:
+                server.login(user, "")
+                server.send_message(msg)
+        else:
+            server: SMTP
+            with smtplib.SMTP(host, port, timeout=timeout) as server:
+              server.send_message(msg)
+    except smtplib.SMTPAuthenticationError as e:
+        raise RuntimeError(f"SMTP autentizace selhala: {e}") from e
+    except smtplib.SMTPConnectError as e:
+        raise RuntimeError(f"SMTP spojení selhalo: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"SMTP chyba: {e}") from e
+
+
 
 
 def _shift_month(delta: int):
@@ -257,30 +262,53 @@ def logout_role():
     st.session_state["nav"] = None
 
 def login_box():
-    st.sidebar.markdown("### Přihlášení")
-    role_choice = st.sidebar.radio("Role", ["Dohled", "Admin"], horizontal=True, key="login_role_choice")
-    pwd = st.sidebar.text_input("Heslo", type="password", key="login_pwd")
+    # CSS: posuň sidebar obsah nahoru a ukliď vzhled expanderu (schovej šipku)
+    st.sidebar.markdown("""
+    <style>
+      [data-testid="stSidebar"] .block-container { padding-top: 6px !important; }
+      /* schovej šipečku expanderu */
+      [data-testid="stSidebar"] [data-testid="stExpander"] summary svg { display: none !important; }
+      /* zmenši hlavičku expanderu, ať je to jen ikonka */
+      [data-testid="stSidebar"] [data-testid="stExpander"] summary {
+        padding: 4px 6px !important;
+      }
+      /* ikonka jako „tlačítko“ */
+      .lock-badge {
+        display:inline-block; padding:6px 8px; border-radius:8px;
+        background:#eef2ff; color:#1e3a8a; font-weight:700; text-decoration:none;
+      }
+      .lock-badge:hover { background:#dbeafe; }
+    </style>
+    """, unsafe_allow_html=True)
 
-    if st.sidebar.button("Přihlásit", key="login_btn"):
-        admin_secret = st.secrets.get("ADMIN_PASSWORD", "")
-        dohled_secret = st.secrets.get("DOHLED_PASSWORD", "")
+    # expander s čistou ikonkou (žádný text)
+    with st.sidebar.expander("🔐", expanded=False):
+        st.markdown('<span class="lock-badge">Správcovský režim</span>', unsafe_allow_html=True)
+        role_choice = st.radio("Režim", ["Dohled", "Admin"], horizontal=True, key="login_role_choice")
+        pwd = st.text_input("Heslo", type="password", key="login_pwd")
 
-        if role_choice == "Admin":
-            if pwd and admin_secret and pwd == admin_secret:
-                st.session_state["role"] = "admin"
-                st.session_state["nav"] = None  # reset navigace
-                st.sidebar.success("Přihlášení OK (Admin).")
-                st.rerun()
+        if st.button("Přihlásit", key="login_btn"):
+            admin_secret  = st.secrets.get("ADMIN_PASSWORD", "")
+            dohled_secret = st.secrets.get("DOHLED_PASSWORD", "")
+
+            if role_choice == "Admin":
+                if pwd and admin_secret and pwd == admin_secret:
+                    st.session_state["role"] = "admin"
+                    st.session_state["nav"] = None
+                    st.success("Správcovský režim (Admin) aktivní.")
+                    st.rerun()
+                else:
+                    st.error("Neplatné heslo pro Admin.")
             else:
-                st.sidebar.error("Neplatné heslo pro Admin.")
-        else:
-            if pwd and dohled_secret and pwd == dohled_secret:
-                st.session_state["role"] = "dohled"
-                st.session_state["nav"] = None
-                st.sidebar.success("Přihlášení OK (Dohled).")
-                st.rerun()
-            else:
-                st.sidebar.error("Neplatné heslo pro Dohled.")
+                if pwd and dohled_secret and pwd == dohled_secret:
+                    st.session_state["role"] = "dohled"
+                    st.session_state["nav"] = None
+                    st.success("Režim dohledu aktivní.")
+                    st.rerun()
+                else:
+                    st.error("Neplatné heslo pro Dohled.")
+
+        st.caption("Běžný uživatel nic vyplňovat nemusí.")
 
 
 def current_paths():
@@ -305,9 +333,39 @@ def assert_writing_to_current_config(target_path: str):
     if Path(target_path).resolve() != Path(cfg_path).resolve():
         raise RuntimeError(f"Zápis do nepovoleného souboru: {target_path}. Aktivní je {cfg_path}.")
 
+def counter_in_form(col, key: str, label: str = "", min_value: int = 0) -> int:
+    # inicializace
+    if key not in st.session_state:
+        st.session_state[key] = 0
 
+    b_minus, b_val, b_plus = col.columns([1, 2, 1])
 
-from pathlib import Path
+    # tlačítka v rámci FORM – musí být form_submit_button
+    dec = b_minus.form_submit_button("−", key=f"{key}_dec")
+    inc = b_plus.form_submit_button("+", key=f"{key}_inc")
+
+    # vlastní číslo (můžeš i ručně přepsat)
+    v = b_val.number_input(
+        label or key,
+        min_value=min_value,
+        step=1,
+        value=int(st.session_state[key]),
+        key=f"{key}_num",
+        label_visibility="collapsed",
+    )
+
+    # sync ručního přepisu
+    if int(v) != st.session_state[key]:
+        st.session_state[key] = int(v)
+
+    # kliky na ± jen upraví stav; formulář se sice “odeslal”, ale neuložíme nic
+    if dec:
+        st.session_state[key] = max(min_value, int(st.session_state[key]) - 1)
+    if inc:
+        st.session_state[key] = int(st.session_state[key]) + 1
+
+    return int(st.session_state[key])
+
 import streamlit as st
 
 def site_login_ui():
@@ -351,11 +409,8 @@ def site_login_ui():
         st.rerun()
 
 # ---------- DB ----------
-from pathlib import Path
 from datetime import date
 from typing import Optional
-import json
-from zoneinfo import ZoneInfo
 from datetime import datetime as _dt
 
 def booking_form_unified(mode: str = "admin", edit_id: Optional[str] = None):
@@ -434,37 +489,39 @@ def booking_form_unified(mode: str = "admin", edit_id: Optional[str] = None):
                                 placeholder="Upřesnění přání, požadavky, diety apod.")
 
             # ✅ Anchor uvnitř formu (OK), žádný download_button tady!
-            LINK = "./static/KS_-2024-25.pdf"
             consent = st.checkbox(
                 "Odesláním žádosti souhlasím s dodržováním pravidel stanovených kolektivní smlouvou.",
                 value=False, key="consent_pub"
             )
-            st.markdown(
-                f'<div style="font-size:12px;margin:-10px 0 8px 26px;">'
-                f'&rarr; <a href="{LINK}" target="_blank">Otevřít kolektivní smlouvu (PDF)</a>'
-                f"</div>", unsafe_allow_html=True
-            )
+
             st.info("Toto je **nezávazná registrace**. Po posouzení kapacit vám dáme vědět s potvrzením/úpravou.")
 
         st.markdown("---")
         btn_label = "Uložit rezervaci" if mode == "admin" else "Odeslat žádost"
-        save_clicked = st.form_submit_button(btn_label)
 
-    # ===== (mimo form) volitelný download button na PDF smlouvy =====
-    #    – nesmí být uvnitř formu, jinak Streamlit vyhodí chybu.
-    if mode == "public":
-        pdf_path = Path("static/KS_2024-25.pdf")
-        if pdf_path.exists():
-            with open(pdf_path, "rb") as fh:
-                st.download_button(
-                    "Stáhnout kolektivní smlouvu (PDF)",
-                    data=fh.read(),
-                    file_name=pdf_path.name,
-                    mime="application/pdf",
-                    key=f"dl_ks_pdf_{mode}"
+        if mode == "public":
+            col_submit, col_dl = st.columns([1, 1])
+            save_clicked = col_submit.form_submit_button(btn_label)
+
+            # „modré tlačítko“ – stylovaný odkaz na PDF
+            if ks_exists():
+                col_dl.markdown(
+                    f"""
+                    <a href="{ks_url()}" target="_blank"
+                       style="
+                         display:inline-block; padding:.55rem .9rem;
+                         border:1px solid #2563eb; background:#7696db; color:#fff;
+                         border-radius:8px; text-decoration:none; font-weight:600;
+                         text-align:center;">
+                      Stáhnout kolektivní smlouvu (PDF)
+                    </a>
+                    """,
+                    unsafe_allow_html=True
                 )
+            else:
+                col_dl.caption("Soubor smlouvy není k dispozici.")
         else:
-            st.warning("Soubor kolektivní smlouvy nenalezen v ./static (KS_2024-25.pdf).")
+            save_clicked = st.form_submit_button(btn_label)
 
     # ===== Uložení =====
     if not save_clicked:
@@ -597,11 +654,12 @@ def get_conn():
         raise RuntimeError("Lokalita není zvolena.")
     return sqlite3.connect(db_path, check_same_thread=False)
 
+from pathlib import Path
+
 @st.cache_data(show_spinner=False)
-def load_config_for_path(config_path: str) -> pd.DataFrame:
+def load_config_for_path(config_path: str, file_mtime: float) -> pd.DataFrame:
     df = pd.read_csv(config_path, encoding="utf-8")
     df.columns = [c.strip().upper() for c in df.columns]
-    # povinné sloupce
     for req in ("POKOJ", "CENA_Z", "CENA_N"):
         if req not in df.columns:
             raise ValueError(f"V configu chybí sloupec: {req}")
@@ -611,8 +669,8 @@ def get_cfg() -> pd.DataFrame:
     _, cfg_path = current_paths()
     if not cfg_path:
         raise RuntimeError("Lokalita není zvolena.")
-    return load_config_for_path(cfg_path)
-
+    mtime = Path(cfg_path).stat().st_mtime  # ⬅️ při změně CSV se změní i cache klíč
+    return load_config_for_path(cfg_path, mtime)
 
 
 def new_booking_id(prefix: str = "RES") -> str:
@@ -1173,8 +1231,8 @@ def rooms_form(per_room: bool, cfg: pd.DataFrame,
                 c1, c2, c3, c4, c5, c6, c7 = st.columns([2,1,1,2,2,1,1])
 
                 rt = c1.selectbox(f"Typ {i}", room_types, key=f"rt_{i}", label_visibility="collapsed")
-                em = c2.number_input(f"Zam {i}", min_value=0, step=1, key=f"em_{i}", label_visibility="collapsed")
-                gu = c3.number_input(f"Hoste {i}", min_value=0, step=1, key=f"gu_{i}", label_visibility="collapsed")
+                em = c2.number_input("Zam.", min_value=0, step=1, key=f"em_{i}", label_visibility="collapsed")
+                gu = c3.number_input("Hosté", min_value=0, step=1, key=f"gu_{i}", label_visibility="collapsed")
 
                 # defaulty per-room datumů ze session_state (nezávislé na globálu)
                 arr_default = st.session_state.get(f"arr_{i}", date.today())
@@ -1206,8 +1264,8 @@ def rooms_form(per_room: bool, cfg: pd.DataFrame,
             else:
                 c1, c2, c3, c4 = st.columns([2,1,1,1])
                 rt = c1.selectbox(f"Typ {i}", room_types, key=f"rt_{i}", label_visibility="collapsed")
-                em = c2.number_input(f"Zam {i}", min_value=0, step=1, key=f"em_{i}", label_visibility="collapsed")
-                gu = c3.number_input(f"Hoste {i}", min_value=0, step=1, key=f"gu_{i}", label_visibility="collapsed")
+                em = c2.number_input("Zam.", min_value=0, step=1, key=f"em_{i}", label_visibility="collapsed")
+                gu = c3.number_input("Hosté", min_value=0, step=1, key=f"gu_{i}", label_visibility="collapsed")
 
                 nights = max(0, days_between(global_arrival, global_departure))
                 pr = price_for(rt, int(em), int(gu), nights, cfg)
@@ -1228,6 +1286,23 @@ def rooms_form(per_room: bool, cfg: pd.DataFrame,
 
     st.markdown(f"**Cena celkem:** {int(total_price)} Kč")
     return rooms_payload
+
+
+
+# --- KOL. SMLOUVA (jednotné jméno a cesty) ---
+KS_BASENAME = "KS_2024-25.pdf"                  # <— sem dáš správný soubor
+KS_PATH = Path("static") / KS_BASENAME
+
+def ks_exists() -> bool:
+    try:
+        return KS_PATH.exists() and KS_PATH.stat().st_size > 0
+    except Exception:
+        return False
+
+def ks_url() -> str:
+    # relativní URL funguje i za reverzní proxy (/hejnice/)
+    return f"./static/{KS_BASENAME}"
+
 
 import pandas as pd
 
@@ -1263,7 +1338,6 @@ def _parse_cz_date(s: str) -> Optional[date]:
         return dt.strptime(s, "%d.%m.%Y").date()
     except Exception:
         return None
-from datetime import timedelta
 
 def occupancy_by_day_boolean() -> pd.DataFrame:
     with get_conn() as con:
@@ -1514,8 +1588,6 @@ def occupancy_by_day_boolean() -> pd.DataFrame:
     df = df.groupby(["date", "room_type"], as_index=False)["occupied"].max()
     return df
 
-from datetime import date
-from typing import Optional
 
 from datetime import date
 from typing import Optional
@@ -1797,7 +1869,6 @@ def overview_ui():
 from io import BytesIO
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as PLImage
@@ -2587,7 +2658,6 @@ def delete_by_id_ui():
 
 def main():
     st.set_page_config(page_title="Rezervace", layout="wide")
-
     # >>> ZAJISTÍ FONTY A MAPOVÁNÍ (bold/italic) JEŠTĚ PŘED GENEROVÁNÍM PDF <<<
     try:
         ensure_czech_fonts()
@@ -2596,17 +2666,20 @@ def main():
         # nepřestřelíme celé UI, ale PDF do té doby nepůjde
 
 
+
     # 1) Výběr lokality než se vůbec ukáže appka
     if "site" not in st.session_state:
         site_login_ui()
         return
 
-    sidebar_site_badge()
-    init_db()
+
 
     # 2) Přihlášení (jen když nejsi přihlášen v žádné roli)
     if current_role() == "public":
         login_box()
+
+    sidebar_site_badge()
+    init_db()
 
     st.sidebar.title("Menu")
 
